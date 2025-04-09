@@ -1,28 +1,30 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Mane - Flask ECS App with CI/CD using CodePipeline in Mumbai (ap-south-1)
+Description: Deploy Flask App using ECS Fargate with CI/CD in Mumbai (ap-south-1) Region
 
 Parameters:
   GitHubOwner:
     Type: String
-    Description: GitHub username/org
+    Description: GitHub username or organization
   GitHubRepo:
     Type: String
     Description: GitHub repository name
   GitHubBranch:
     Type: String
     Default: main
+    Description: GitHub branch to build from
   GitHubOAuthToken:
     Type: String
     NoEcho: true
-    Description: GitHub personal access token
+    Description: GitHub personal access token for CodePipeline integration
 
 Resources:
+  # VPC and Networking
   ManeVPC:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.20.0.0/16
-      EnableDnsSupport: true
+      CidrBlock: 10.0.0.0/16
       EnableDnsHostnames: true
+      EnableDnsSupport: true
       Tags:
         - Key: Name
           Value: ManeVPC
@@ -40,51 +42,123 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref ManeVPC
-      CidrBlock: 10.20.1.0/24
+      CidrBlock: 10.0.1.0/24
       AvailabilityZone: ap-south-1a
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ManePublicSubnet1
+
+  ManePublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: ap-south-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ManePublicSubnet2
 
   ManePrivateSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref ManeVPC
-      CidrBlock: 10.20.2.0/24
+      CidrBlock: 10.0.3.0/24
       AvailabilityZone: ap-south-1a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ManePrivateSubnet1
 
-  ManeRouteTable:
+  ManePrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: ap-south-1b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: ManePrivateSubnet2
+
+  ManeNatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ManeNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ManeNatGatewayEIP.AllocationId
+      SubnetId: !Ref ManePublicSubnet1
+
+  ManeRouteTablePublic:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref ManeVPC
 
-  ManePublicRoute:
+  ManeRoutePublic:
     Type: AWS::EC2::Route
     Properties:
-      RouteTableId: !Ref ManeRouteTable
+      RouteTableId: !Ref ManeRouteTablePublic
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref ManeInternetGateway
 
-  ManeSubnetRouteTableAssociation:
+  ManeRouteTablePrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ManeVPC
+
+  ManeRoutePrivate:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref ManeNatGateway
+
+  ManePublicSubnet1RouteTableAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      RouteTableId: !Ref ManeRouteTable
+      RouteTableId: !Ref ManeRouteTablePublic
       SubnetId: !Ref ManePublicSubnet1
 
-  ManeECRRepository:
+  ManePublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePublic
+      SubnetId: !Ref ManePublicSubnet2
+
+  ManePrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      SubnetId: !Ref ManePrivateSubnet1
+
+  ManePrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      SubnetId: !Ref ManePrivateSubnet2
+
+  # ECR Repository
+  ManeECRRepo:
     Type: AWS::ECR::Repository
     Properties:
-      RepositoryName: mane-flask-ecs-app
+      RepositoryName: flask-ecs-app
 
+  # ECS Cluster
   ManeCluster:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: ManeCluster
 
-  ManeExecutionRole:
+  # IAM Role for ECS Task Execution
+  ManeTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: ManeECSExecutionRole
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -93,45 +167,39 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
-  ManeBuildRole:
-    Type: AWS::IAM::Role
+  # CloudWatch Logs
+  ManeLogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      RoleName: ManeCodeBuildRole
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codebuild.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
-        - arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      LogGroupName: /ecs/mane-flask-app
+      RetentionInDays: 7
 
-  ManePipelineRole:
-    Type: AWS::IAM::Role
+  # ECS Task Definition
+  ManeECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
     Properties:
-      RoleName: ManeCodePipelineRole
-      AssumeRolePolicyDocument:
-        Version: 2012-10-17
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codepipeline.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSCodePipelineFullAccess
-        - arn:aws:iam::aws:policy/AmazonS3FullAccess
-        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt ManeTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: flask-container
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/flask-ecs-app:latest"
+          PortMappings:
+            - ContainerPort: 5000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ManeLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: flask
 
-  ManeArtifactsBucket:
-    Type: AWS::S3::Bucket
-
-  ManeALBSG:
+  # Security Groups
+  ManeALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP
+      GroupDescription: Allow HTTP from internet
       VpcId: !Ref ManeVPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -139,23 +207,40 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
 
+  ManeECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS
+      VpcId: !Ref ManeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref ManeALBSecurityGroup
+
+  # Application Load Balancer
   ManeALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
       Name: ManeALB
-      Subnets: [!Ref ManePublicSubnet1]
-      SecurityGroups: [!Ref ManeALBSG]
       Scheme: internet-facing
+      Subnets:
+        - !Ref ManePublicSubnet1
+        - !Ref ManePublicSubnet2
+      SecurityGroups:
+        - !Ref ManeALBSecurityGroup
 
-  ManeALBTargetGroup:
+  ManeTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: mane-tg
+      VpcId: !Ref ManeVPC
       Port: 5000
       Protocol: HTTP
-      VpcId: !Ref ManeVPC
       TargetType: ip
       HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: 200
 
   ManeALBListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
@@ -165,80 +250,150 @@ Resources:
       Protocol: HTTP
       DefaultActions:
         - Type: forward
-          TargetGroupArn: !Ref ManeALBTargetGroup
+          TargetGroupArn: !Ref ManeTargetGroup
 
-  ManeTaskDefinition:
-    Type: AWS::ECS::TaskDefinition
-    Properties:
-      Family: mane-flask-task
-      Cpu: '256'
-      Memory: '512'
-      NetworkMode: awsvpc
-      RequiresCompatibilities: [FARGATE]
-      ExecutionRoleArn: !GetAtt ManeExecutionRole.Arn
-      ContainerDefinitions:
-        - Name: mane-flask-container
-          Image: <placeholder-image>
-          PortMappings:
-            - ContainerPort: 5000
-
-  ManeService:
+  # ECS Fargate Service
+  ManeECSService:
     Type: AWS::ECS::Service
     DependsOn: ManeALBListener
     Properties:
       Cluster: !Ref ManeCluster
       LaunchType: FARGATE
-      DesiredCount: 1
-      TaskDefinition: !Ref ManeTaskDefinition
+      DesiredCount: 2
+      TaskDefinition: !Ref ManeECSTaskDefinition
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
-          Subnets: [!Ref ManePrivateSubnet1]
-          SecurityGroups: [!Ref ManeALBSG]
+          Subnets:
+            - !Ref ManePrivateSubnet1
+            - !Ref ManePrivateSubnet2
+          SecurityGroups:
+            - !Ref ManeECSSecurityGroup
       LoadBalancers:
-        - ContainerName: mane-flask-container
+        - ContainerName: flask-container
           ContainerPort: 5000
-          TargetGroupArn: !Ref ManeALBTargetGroup
+          TargetGroupArn: !Ref ManeTargetGroup
 
-  ManeCodeBuild:
+  # Auto Scaling
+  ManeECSAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  ManeScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 2
+      ResourceId: !Sub "service/${ManeCluster}/${ManeECSService}"
+      RoleARN: !GetAtt ManeECSAutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ManeScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ManeCPUScalingPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ManeScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60.0
+
+  # S3 Bucket for Pipeline Artifacts
+  ManePipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub mane-pipeline-artifacts-${AWS::AccountId}
+
+  # CodeBuild
+  ManeCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecr:*"
+                  - "logs:*"
+                  - "cloudwatch:*"
+                  - "ecs:UpdateService"
+                  - "ecs:DescribeServices"
+                  - "iam:PassRole"
+                Resource: "*"
+
+  ManeCodeBuildProject:
     Type: AWS::CodeBuild::Project
     Properties:
-      Name: ManeBuild
+      Name: ManeBuildProject
+      ServiceRole: !GetAtt ManeCodeBuildRole.Arn
       Source:
         Type: GITHUB
         Location: !Sub https://github.com/${GitHubOwner}/${GitHubRepo}.git
         BuildSpec: buildspec.yml
       Environment:
-        ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/standard:7.0
         Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
         PrivilegedMode: true
         EnvironmentVariables:
           - Name: AWS_ACCOUNT_ID
             Value: !Ref AWS::AccountId
           - Name: AWS_REGION
-            Value: ap-south-1
+            Value: !Ref AWS::Region
       Artifacts:
-        Type: S3
-        Location: !Ref ManeArtifactsBucket
-      ServiceRole: !GetAtt ManeBuildRole.Arn
+        Type: NO_ARTIFACTS
 
-  ManePipeline:
+  # CodePipeline
+  ManePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodePipelineFullAccess
+
+  ManeCodePipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
+      Name: ManePipeline
       RoleArn: !GetAtt ManePipelineRole.Arn
       ArtifactStore:
         Type: S3
-        Location: !Ref ManeArtifactsBucket
+        Location: !Ref ManePipelineArtifactsBucket
       Stages:
         - Name: Source
           Actions:
-            - Name: GitHub_Source
+            - Name: GitHubSource
               ActionTypeId:
                 Category: Source
                 Owner: ThirdParty
                 Provider: GitHub
-                Version: '1'
+                Version: 1
               OutputArtifacts:
                 - Name: SourceOutput
               Configuration:
@@ -246,33 +401,30 @@ Resources:
                 Repo: !Ref GitHubRepo
                 Branch: !Ref GitHubBranch
                 OAuthToken: !Ref GitHubOAuthToken
-
         - Name: Build
           Actions:
-            - Name: CodeBuild
+            - Name: BuildDockerImage
               ActionTypeId:
                 Category: Build
                 Owner: AWS
                 Provider: CodeBuild
-                Version: '1'
+                Version: 1
               InputArtifacts:
                 - Name: SourceOutput
+              Configuration:
+                ProjectName: !Ref ManeCodeBuildProject
               OutputArtifacts:
                 - Name: BuildOutput
-              Configuration:
-                ProjectName: !Ref ManeCodeBuild
 
-        - Name: Deploy
-          Actions:
-            - Name: ECSDeploy
-              ActionTypeId:
-                Category: Deploy
-                Owner: AWS
-                Provider: ECS
-                Version: '1'
-              InputArtifacts:
-                - Name: BuildOutput
-              Configuration:
-                ClusterName: !Ref ManeCluster
-                ServiceName: !Ref ManeService
-                FileName: imagedefinitions.json
+Outputs:
+  VPCId:
+    Value: !Ref ManeVPC
+  PublicSubnet1:
+    Value: !Ref ManePublicSubnet1
+  PrivateSubnet1:
+    Value: !Ref ManePrivateSubnet1
+  ClusterName:
+    Value: !Ref ManeCluster
+  LoadBalancerDNSName:
+    Description: Public DNS of the Application Load Balancer
+    Value: !GetAtt ManeALB.DNSName
