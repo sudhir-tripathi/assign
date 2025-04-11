@@ -1,0 +1,269 @@
+# app-stack.yml
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Mane App Stack: Creates ECR, ECS Cluster, Task Def, Service, ALB, SGs, AutoScaling - Mumbai Region (ap-south-1)"
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Description: Name of the CloudFormation stack that created the network resources (e.g., mane-network-stack).
+    Default: mane-network-stack # Provide the actual name of your network stack
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Initial number of tasks for the ECS service.
+  MaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum number of tasks for Auto Scaling.
+  CpuTargetValue:
+    Type: Number
+    Default: 60
+    Description: Target CPU utilization percentage for Auto Scaling.
+  EcrRepoName:
+    Type: String
+    Default: mane-flask-app # Consistent name used in buildspec
+    Description: Name for the ECR Repository.
+
+Resources:
+  # --- ECR / ECS Cluster / Task Def / Roles / Logging ---
+  ManeECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepoName
+      # Add ImageScanningConfiguration or LifecyclePolicy if needed
+
+  ManeCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-Cluster"
+
+  ManeTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSTaskExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      # Add specific ECR pull permissions if needed, though the managed policy usually covers it.
+
+  ManeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-flask-app"
+      RetentionInDays: 7
+
+  ManeECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-flask-task"
+      RequiresCompatibilities: [FARGATE]
+      Cpu: '256' # Adjust as needed
+      Memory: '512' # Adjust as needed
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt ManeTaskExecutionRole.Arn
+      # TaskRoleArn: !Ref MyTaskRole # Optional: Define if your app needs specific AWS permissions
+      ContainerDefinitions:
+        - Name: flask-container # Must match ContainerName in LoadBalancers section of Service
+          # IMPORTANT: A placeholder image must exist for initial stack creation.
+          # Push manually: aws ecr get-login-password --region ap-south-1 | docker login ... ; docker tag <some-image> <account-id>.dkr.ecr.ap-south-1.amazonaws.com/mane-flask-app:latest ; docker push ...
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ManeECRRepo}:latest"
+          PortMappings:
+            - ContainerPort: 5000 # Port your Flask app runs on
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ManeLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: flask # Prefix for log streams within the group
+
+  # --- ALB / Target Group / Listener / Security Groups ---
+  ManeALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Allow HTTP from internet to ALB - ${AWS::StackName}"
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VPCId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0 # Allow HTTP from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ALB-SG"
+
+  ManeECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Allow traffic from ALB to ECS Tasks - ${AWS::StackName}"
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VPCId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000 # Match ContainerPort
+          ToPort: 5000 # Match ContainerPort
+          SourceSecurityGroupId: !Ref ManeALBSecurityGroup # Only allow traffic from the ALB SG
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ECS-SG"
+
+  ManeALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-ALB"
+      Scheme: internet-facing
+      Subnets: # ALB in Public Subnets
+        - !ImportValue
+            Fn::Sub: "${NetworkStackName}-PublicSubnet1Id"
+        - !ImportValue
+            Fn::Sub: "${NetworkStackName}-PublicSubnet2Id"
+      SecurityGroups:
+        - !Ref ManeALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ALB"
+
+  ManeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-TG"
+      VpcId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-VPCId"
+      Port: 5000 # Match ContainerPort
+      Protocol: HTTP
+      TargetType: ip # Required for Fargate
+      HealthCheckPath: / # Path for health checks (ensure your app responds with 200 OK)
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200 # Expect HTTP 200 for healthy targets
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-TG"
+
+  ManeALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ManeALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ManeTargetGroup
+          # Consider adding a redirect from HTTP to HTTPS if you set up HTTPS later
+
+  # --- ECS Service ---
+  ManeECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ManeALBListener # Ensure listener is created before service tries to register
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-FlaskService"
+      Cluster: !Ref ManeCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref ManeECSTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED # Tasks in private subnets don't need public IPs
+          Subnets: # Service Tasks in Private Subnets
+            - !ImportValue
+                Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+            - !ImportValue
+                Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+          SecurityGroups:
+            - !Ref ManeECSSecurityGroup # Attach the ECS-specific security group
+      LoadBalancers:
+        - ContainerName: flask-container # Must match name in Task Definition
+          ContainerPort: 5000 # Must match port in Task Definition
+          TargetGroupArn: !Ref ManeTargetGroup
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        # MinimumHealthyPercent / MaximumPercent can be adjusted if needed
+      # EnableExecuteCommand: true # Optional: If you want to use ECS Exec
+
+  # --- ECS Auto Scaling ---
+  ManeECSAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSAutoScaleRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  ManeScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref DesiredCount # Start MinCapacity at DesiredCount
+      ResourceId: !Join ['', ['service/', !Ref ManeCluster, '/', !GetAtt ManeECSService.Name]]
+      RoleARN: !GetAtt ManeECSAutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ManeScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-CPUScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ManeScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+        ScaleInCooldown: 60 # Seconds before scaling in again
+        ScaleOutCooldown: 60 # Seconds before scaling out again
+
+Outputs:
+  ClusterName:
+    Description: The name of the ECS Cluster
+    Value: !Ref ManeCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+
+  ECSServiceName:
+    Description: The name of the ECS Service
+    Value: !GetAtt ManeECSService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSServiceName"
+
+  ECRRepositoryName:
+    Description: The name of the ECR Repository
+    Value: !Ref ManeECRRepo
+    Export:
+      Name: !Sub "${AWS::StackName}-ECRRepositoryName"
+
+  ALBDNSName:
+    Description: Public DNS of the Application Load Balancer
+    Value: !GetAtt ManeALB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBDNSName"
+
+  ALBHostedZoneId:
+      Description: The Hosted Zone ID of the Application Load Balancer
+      Value: !GetAtt ManeALB.CanonicalHostedZoneID
+      Export:
+        Name: !Sub "${AWS::StackName}-ALBHostedZoneId"
+
+  TargetGroupName:
+    Description: The name of the Target Group
+    Value: !GetAtt ManeTargetGroup.TargetGroupName
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupName"

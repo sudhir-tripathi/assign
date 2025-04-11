@@ -1,0 +1,197 @@
+# network-stack.yml
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Mane VPC Stack: Creates VPC, Subnets, IGW, NAT GW, Route Tables - Mumbai Region (ap-south-1)"
+
+Parameters:
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for Public Subnet 1 in AZ ap-south-1a.
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for Public Subnet 2 in AZ ap-south-1b.
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for Private Subnet 1 in AZ ap-south-1a.
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: CIDR block for Private Subnet 2 in AZ ap-south-1b.
+
+Resources:
+  ManeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+
+  ManeInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-IGW"
+
+  ManeAttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ManeVPC
+      InternetGatewayId: !Ref ManeInternetGateway
+
+  ManePublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: ap-south-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet1"
+
+  ManePublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: !Ref PublicSubnet2CIDR
+      AvailabilityZone: ap-south-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet2"
+
+  ManePrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      AvailabilityZone: ap-south-1a
+      MapPublicIpOnLaunch: false # Private Subnets should not map public IPs
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet1"
+
+  ManePrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ManeVPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      AvailabilityZone: ap-south-1b
+      MapPublicIpOnLaunch: false # Private Subnets should not map public IPs
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet2"
+
+  ManeNatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: ManeAttachGateway # Ensure IGW is attached before creating EIP/NAT
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NAT-EIP"
+
+  ManeNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ManeNatGatewayEIP.AllocationId
+      SubnetId: !Ref ManePublicSubnet1 # NAT Gateway needs to be in a public subnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATGateway"
+
+  ManeRouteTablePublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ManeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRouteTable"
+
+  ManeRoutePublic:
+    Type: AWS::EC2::Route
+    DependsOn: ManeAttachGateway
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ManeInternetGateway
+
+  ManePublicSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePublic
+      SubnetId: !Ref ManePublicSubnet1
+
+  ManePublicSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePublic
+      SubnetId: !Ref ManePublicSubnet2
+
+  ManeRouteTablePrivate:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ManeVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRouteTable"
+
+  ManeRoutePrivate:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref ManeNatGateway # Route private traffic through NAT
+
+  ManePrivateSubnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      SubnetId: !Ref ManePrivateSubnet1
+
+  ManePrivateSubnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ManeRouteTablePrivate
+      SubnetId: !Ref ManePrivateSubnet2
+
+Outputs:
+  VPCId:
+    Description: The ID of the VPC
+    Value: !Ref ManeVPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCId"
+
+  PublicSubnet1Id:
+    Description: The ID of Public Subnet 1
+    Value: !Ref ManePublicSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet1Id"
+
+  PublicSubnet2Id:
+    Description: The ID of Public Subnet 2
+    Value: !Ref ManePublicSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicSubnet2Id"
+
+  PrivateSubnet1Id:
+    Description: The ID of Private Subnet 1
+    Value: !Ref ManePrivateSubnet1
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet1Id"
+
+  PrivateSubnet2Id:
+    Description: The ID of Private Subnet 2
+    Value: !Ref ManePrivateSubnet2
+    Export:
+      Name: !Sub "${AWS::StackName}-PrivateSubnet2Id"
